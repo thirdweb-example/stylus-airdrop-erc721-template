@@ -10,6 +10,22 @@ use stylus_sdk::{
     alloy_primitives::{Address, B256, U256}, call::RawCall, crypto, prelude::*
 };
 
+// Compact error handling
+#[derive(SolidityError)]
+pub enum AirdropErrors {
+    AirdropError(AirdropError),
+}
+
+// Error codes for compact error handling
+pub const ERROR_LENGTH_MISMATCH: u8 = 1;
+pub const ERROR_NO_MERKLE_ROOT: u8 = 2;
+pub const ERROR_INVALID_PROOF: u8 = 3;
+pub const ERROR_ALREADY_CLAIMED: u8 = 4;
+pub const ERROR_REQUEST_EXPIRED: u8 = 5;
+pub const ERROR_UID_ALREADY_USED: u8 = 6;
+pub const ERROR_INVALID_SIGNATURE: u8 = 7;
+pub const ERROR_NOT_OWNER: u8 = 8;
+
 sol_interface! {
     interface IERC721 {
         function safeTransferFrom(address from, address to, uint256 token_id) external;
@@ -29,6 +45,9 @@ sol! {
         uint256 expirationTimestamp;
         AirdropContentERC721[] contents;
     }
+
+    // Compact error codes
+    error AirdropError(uint8 code);
 }
 
 sol_storage! {
@@ -68,8 +87,10 @@ impl StylusAirdropERC721 {
         token:      Address,
         recipients: Vec<Address>,
         token_ids:    Vec<U256>,
-    ) {
-        assert!(recipients.len() == token_ids.len(), "!length");
+    ) -> Result<(), AirdropErrors> {
+        if recipients.len() != token_ids.len() {
+            return Err(AirdropErrors::AirdropError(AirdropError { code: ERROR_LENGTH_MISMATCH }));
+        }
 
         let erc721 = IERC721::from(token);
         let sender = self.vm().msg_sender();
@@ -81,6 +102,7 @@ impl StylusAirdropERC721 {
         }
 
         // TODO: emit log
+        Ok(())
     }
 
     #[payable]
@@ -89,26 +111,29 @@ impl StylusAirdropERC721 {
         token:   Address,
         token_id:  U256,
         proofs:  Vec<B256>,
-    ) {
+    ) -> Result<(), AirdropErrors> {
         let receiver = self.vm().msg_sender();
 
         // 1. root must exist
         let root = self.tokenMerkleRoot.get(token);
-        assert!(root != B256::ZERO, "!r");
+        if root == B256::ZERO {
+            return Err(AirdropErrors::AirdropError(AirdropError { code: ERROR_NO_MERKLE_ROOT }));
+        }
 
         // 2. validate proof of (receiver, token_id)
         let leaf = crypto::keccak(&(encode_pair(receiver, token_id)));
-        assert!(
-            verify_proof(&proofs, root, leaf),
-            "!v"
-        );
+        if !verify_proof(&proofs, root, leaf) {
+            return Err(AirdropErrors::AirdropError(AirdropError { code: ERROR_INVALID_PROOF }));
+        }
 
         // 3. check claim not already used
         let round  = self.tokenConditionId.get(token);
         let round_u64: u64 = round.to::<u64>();
         let key    = crypto::keccak(&encode_claim_key(round_u64, receiver, token));
-        assert!(!self.claimed.get(key), "!c");
-        self.claimed.insert(root, true);
+        if self.claimed.get(key) {
+            return Err(AirdropErrors::AirdropError(AirdropError { code: ERROR_ALREADY_CLAIMED }));
+        }
+        self.claimed.insert(key, true);
 
         // 4. transfer
         let erc721 = IERC721::from(token);
@@ -118,6 +143,7 @@ impl StylusAirdropERC721 {
             .expect("fail");
 
         // TODO: event
+        Ok(())
     }
 
     #[payable]
@@ -125,7 +151,7 @@ impl StylusAirdropERC721 {
         &mut self,
         req_raw: Vec<u8>,
         sig: [u8; 65],
-    ) {
+    ) -> Result<(), AirdropErrors> {
         // 1. decode req from raw bytes
         let req_tuple: <AirdropRequestERC721 as SolType>::RustType = <AirdropRequestERC721 as SolType>::abi_decode(&req_raw, true)
         .unwrap();
@@ -140,14 +166,19 @@ impl StylusAirdropERC721 {
         // 2. checks
         let expiry = req.expirationTimestamp; 
         let now = U256::from(self.vm().block_timestamp());
-        assert!(now <= expiry, "exp");
+        if now > expiry {
+            return Err(AirdropErrors::AirdropError(AirdropError { code: ERROR_REQUEST_EXPIRED }));
+        }
 
         let uid_used = self.processed.get(req.uid);
-        assert!(!uid_used, "!uid");
+        if uid_used {
+            return Err(AirdropErrors::AirdropError(AirdropError { code: ERROR_UID_ALREADY_USED }));
+        }
 
         let owner = self.owner.get();
-        assert!(self.is_valid_sig(&req, &sig, owner), // verify signature
-                "!v");
+        if !self.is_valid_sig(&req, &sig, owner) {
+            return Err(AirdropErrors::AirdropError(AirdropError { code: ERROR_INVALID_SIGNATURE }));
+        }
 
         // 3. mark uid as processed
         self.processed.insert(req.uid, true);
@@ -162,6 +193,7 @@ impl StylusAirdropERC721 {
         }
 
         // TODO: emit log
+        Ok(())
     }
 
     pub fn set_merkle_root(
@@ -169,8 +201,8 @@ impl StylusAirdropERC721 {
         token: Address,
         root:  B256,
         reset: bool,
-    ) {
-        self.only_owner();
+    ) -> Result<(), AirdropErrors> {
+        self.only_owner()?;
 
         if reset || self.tokenConditionId.get(token) == U64::from(0) {
             let next = self.tokenConditionId.get(token) + U64::from(1u8);
@@ -180,6 +212,7 @@ impl StylusAirdropERC721 {
         self.tokenMerkleRoot.insert(token, root);
         
         // TODO: emit log
+        Ok(())
     }
 
     pub fn owner_addr(&self) -> Address { self.owner.get() }
@@ -203,8 +236,11 @@ impl StylusAirdropERC721 {
 
 impl StylusAirdropERC721 {
     #[inline(always)]
-    fn only_owner(&self) {
-        assert!(self.vm().msg_sender() == self.owner.get(), "NA");
+    fn only_owner(&self) -> Result<(), AirdropErrors> {
+        if self.vm().msg_sender() != self.owner.get() {
+            return Err(AirdropErrors::AirdropError(AirdropError { code: ERROR_NOT_OWNER }));
+        }
+        Ok(())
     }
 
     fn is_valid_sig(&self, req: &AirdropRequestERC721, sig: &[u8; 65], owner: Address) -> bool {
