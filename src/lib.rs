@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use alloy_primitives::{b256, U64};
 use alloy_sol_types::{sol, SolType};
 use stylus_sdk::{
-    alloy_primitives::{Address, B256, U256}, block, call::RawCall, contract, crypto, evm, msg, prelude::*
+    alloy_primitives::{Address, B256, U256}, call::RawCall, crypto, prelude::*
 };
 
 sol_interface! {
@@ -72,10 +72,11 @@ impl StylusAirdropERC721 {
         assert!(recipients.len() == token_ids.len(), "!length");
 
         let erc721 = IERC721::from(token);
+        let sender = self.vm().msg_sender();
 
         for i in 0..recipients.len() {
             erc721
-                .safe_transfer_from(&mut *self, msg::sender(), recipients[i], token_ids[i])
+                .safe_transfer_from(&mut *self, sender, recipients[i], token_ids[i])
                 .expect("fail");
         }
 
@@ -89,7 +90,7 @@ impl StylusAirdropERC721 {
         token_id:  U256,
         proofs:  Vec<B256>,
     ) {
-        let receiver = msg::sender();
+        let receiver = self.vm().msg_sender();
 
         // 1. root must exist
         let root = self.tokenMerkleRoot.get(token);
@@ -138,14 +139,14 @@ impl StylusAirdropERC721 {
 
         // 2. checks
         let expiry = req.expirationTimestamp; 
-        let now = U256::from(block::timestamp());
+        let now = U256::from(self.vm().block_timestamp());
         assert!(now <= expiry, "exp");
 
         let uid_used = self.processed.get(req.uid);
         assert!(!uid_used, "!uid");
 
         let owner = self.owner.get();
-        assert!(is_valid_sig(&req, &sig, owner), // verify signature
+        assert!(self.is_valid_sig(&req, &sig, owner), // verify signature
                 "!v");
 
         // 3. mark uid as processed
@@ -182,12 +183,44 @@ impl StylusAirdropERC721 {
     }
 
     pub fn owner_addr(&self) -> Address { self.owner.get() }
+
+    pub fn domain_separator(&self) -> B256 {
+        let name_hash    = crypto::keccak(b"Airdrop");
+        let version_hash = crypto::keccak(b"1");
+        let chain_bytes: [u8; 32] = U256::from(self.vm().chain_id()).to_be_bytes::<32>();
+        let verifying_word: [u8; 32] = address_word(&self.vm().contract_address());
+
+        crypto::keccak(&[
+            &EIP712_DOMAIN_TYPEHASH[..],
+            &name_hash[..],
+            &version_hash[..],
+            &chain_bytes[..],
+            &verifying_word[..],
+        ].concat())
+    }
+
 }
 
 impl StylusAirdropERC721 {
     #[inline(always)]
     fn only_owner(&self) {
-        assert!(msg::sender() == self.owner.get(), "NA");
+        assert!(self.vm().msg_sender() == self.owner.get(), "NA");
+    }
+
+    fn is_valid_sig(&self, req: &AirdropRequestERC721, sig: &[u8; 65], owner: Address) -> bool {
+        let content_hash = hash_content(&req.contents);
+        let struct_hash  = hash_request(req, content_hash);
+
+        let digest = crypto::keccak(&[
+            b"\x19\x01",
+            &self.domain_separator()[..],
+            &struct_hash[..],
+        ].concat());
+
+        match ecrecover(digest, sig) {
+            Some(addr) => addr == owner,
+            None => false,
+        }
     }
 }
 
@@ -228,22 +261,6 @@ fn address_word(addr: &Address) -> [u8; 32] {
     out
 }
 
-fn domain_separator() -> B256 {
-    let name_hash    = crypto::keccak(b"Airdrop");
-    let version_hash = crypto::keccak(b"1");
-    // let chain_id     = U256::from(block::chainid());
-    // let verifying    = contract::address();
-    let chain_bytes: [u8; 32] = U256::from(block::chainid()).to_be_bytes::<32>();
-    let verifying_word: [u8; 32] = address_word(&contract::address());
-
-    crypto::keccak(&[
-        &EIP712_DOMAIN_TYPEHASH[..],
-        &name_hash[..],
-        &version_hash[..],
-        &chain_bytes[..],
-        &verifying_word[..],
-    ].concat())
-}
 
 fn hash_content(contents: &[AirdropContentERC721]) -> B256 {
     let mut buf = Vec::with_capacity(32 * contents.len());
@@ -305,18 +322,3 @@ fn ecrecover(digest: B256, sig: &[u8; 65]) -> Option<Address> {
     if addr == Address::ZERO { None } else { Some(addr) }
 }
 
-fn is_valid_sig(req: &AirdropRequestERC721, sig: &[u8; 65], owner: Address) -> bool {
-    let content_hash = hash_content(&req.contents);
-    let struct_hash  = hash_request(req, content_hash);
-
-    let digest = crypto::keccak(&[
-        b"\x19\x01",
-        &domain_separator()[..],
-        &struct_hash[..],
-    ].concat());
-
-    match ecrecover(digest, sig) {
-        Some(addr) => addr == owner,
-        None => false,
-    }
-}
