@@ -47,6 +47,11 @@ sol! {
         AirdropContentERC721[] contents;
     }
 
+    event AirdropExecuted(address indexed token, address indexed sender, uint256 count);
+    event AirdropClaimed(address indexed token, address indexed receiver, uint256 tokenId);
+    event AirdropExecutedWithSignature(address indexed token, address indexed signer, bytes32 uid, uint256 count);
+    event MerkleRootSet(address indexed token, bytes32 merkleRoot);
+
     // Compact error codes
     error AirdropError(uint8 code);
 }
@@ -98,7 +103,11 @@ impl StylusAirdropERC721 {
                 .expect("fail");
         }
 
-        // TODO: emit log
+        self.vm().log(AirdropExecuted {
+            token,
+            sender,
+            count: U256::from(contents.len()),
+        });
         Ok(())
     }
 
@@ -140,7 +149,11 @@ impl StylusAirdropERC721 {
             .safe_transfer_from(self.vm(), config, owner, receiver, token_id)
             .expect("fail");
 
-        // TODO: event
+        self.vm().log(AirdropClaimed {
+            token,
+            receiver,
+            tokenId: token_id,
+        });
         Ok(())
     }
 
@@ -196,7 +209,12 @@ impl StylusAirdropERC721 {
                 .expect("fail"); // transfer failed
         }
 
-        // TODO: emit log
+        self.vm().log(AirdropExecutedWithSignature {
+            token: request.tokenAddress,
+            signer: owner,
+            uid: request.uid,
+            count: U256::from(request.contents.len()),
+        });
         Ok(())
     }
 
@@ -214,8 +232,11 @@ impl StylusAirdropERC721 {
         }
 
         self.tokenMerkleRoot.insert(token, token_merkle_root);
-        
-        // TODO: emit log
+
+        self.vm().log(MerkleRootSet {
+            token,
+            merkleRoot: token_merkle_root,
+        });
         Ok(())
     }
 
@@ -334,10 +355,22 @@ fn hash_request(req: &AirdropRequestERC721, contents_hash: B256) -> B256 {
     ].concat())
 }
 
+// secp256k1n / 2 — signatures with s > this value are rejected per EIP-2
+const SECP256K1N_HALF: U256 = U256::from_limbs([
+    0xBFD25E8CD0364140,
+    0xBAAEDCE6AF48A03B,
+    0xFFFFFFFFFFFFFFFE,
+    0x7FFFFFFFFFFFFFFF,
+]);
+
 fn ecrecover(digest: B256, sig: &[u8; 65], host: &dyn stylus_sdk::prelude::Host) -> Option<Address> {
     let (r, s, v) = (&sig[0..32], &sig[32..64], sig[64]);
 
     if v != 27 && v != 28 { return None }
+
+    // EIP-2: reject high-S signatures to prevent malleability
+    let s_val = U256::from_be_slice(s);
+    if s_val > SECP256K1N_HALF { return None }
 
     let mut input = [0u8; 128];
     input[..32].copy_from_slice(&digest.as_slice());
@@ -352,7 +385,7 @@ fn ecrecover(digest: B256, sig: &[u8; 65], host: &dyn stylus_sdk::prelude::Host)
     };
     let out = unsafe {
         RawCall::new(host)
-            .gas(25_000)                    
+            .gas(25_000)
             .call(precompile_addr,
                   &input)
     }
